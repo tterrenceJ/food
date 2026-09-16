@@ -1,0 +1,6 @@
+import geopandas as gpd
+
+parcels = gpd.read_file(
+    "https://gis.shelbycountytn.gov/public/rest/services/BaseMap/Assessor/MapServer/0/query"
+    "?where=1%3D1&outFields=*&f=geojson"
+)
