@@ -1,0 +1,211 @@
+"""
+ingest_fara.py — Phase 1b: USDA Food Access Research Atlas (validation data only)
+
+Not in the tutorial's own file tree (it lists ingest_census.py / ingest_osm.py /
+ingest_parcels.py but nothing for the fourth source, the Atlas itself) — added here
+because Phase 1b and Phase 8 both depend on it, and "acquire the four data sources"
+means four scripts, not three.
+
+Reads directly from the two untouched downloads in data/raw/ and writes clean,
+Shelby-County-only CSVs to data/processed/. Never touches the optimization — this
+is validation data (§2, §8), full stop.
+
+Handles four things the naive `pd.read_csv(...)` from the tutorial's own snippets
+would NOT survive, all discovered by actually opening these two files rather than
+assuming a schema:
+
+1. "Shelby County" exists in NINE states (AL, IL, IN, IA, KY, MO, OH, TN, TX) in
+   this dataset. Filtering on county name alone silently pulls in Shelby County,
+   Alabama. Every filter here is (State == ...) AND (County == ...), never county
+   alone.
+2. The 2019 file encodes missing values as the literal string "NULL", not a blank
+   cell -> must be passed to `na_values`, or e.g. LAPOP1_10 silently becomes a
+   column of mixed strings/numbers instead of a numeric column with real NaNs.
+3. The 2019 file's CensusTract column has lost its leading zero wherever the state
+   FIPS code itself starts with 0 (e.g. Alabama's 01117030102 is stored as
+   1117030102 — a plain integer, not a zero-padded code). Doesn't affect Tennessee
+   (FIPS 47) but WILL bite you if you ever re-run this for AL/AK/AZ/AR/CA/CO/CT/etc,
+   which Aim 2 explicitly wants to support. Fixed generically with .str.zfill(11).
+4. At least one non-UTF-8 byte (an accented character in "Doña Ana County", NM) is
+   present in the 2025 files, which crashes a default pd.read_csv before it ever
+   reaches Tennessee rows (New Mexico's FIPS 35 sorts before Tennessee's 47 in this
+   file). Read with encoding="latin-1" instead.
+
+The 2019 Atlas and the 2025 SRAM release are NOT the same product wearing a new
+coat of paint:
+- 2019 ("Food Access Research Atlas"): 2010 Census tracts, LILA flags computed
+  against general supermarkets/grocery stores. This is "LRAM" in the tutorial's
+  terminology.
+- 2025 ("SRAM" = SNAP-authorized Retailer Access Map, per its own Read Me — not a
+  renamed LILA column on the same old table): 2020 Census tracts, split into three
+  files (general tract demographics, straight-line-distance access flags, and a
+  genuinely new driving/network-distance access flags file), and — this is the
+  substantive change, not just a geography update — its LILA-style flags are
+  computed against distance to any SNAP-authorized retailer, not distance to a
+  supermarket/grocery store specifically. That's a different universe of stores
+  (small SNAP-authorized corner stores and pharmacies count here; they didn't in
+  the old LILA definition). Treat "SRAM says this tract is fine" and "LRAM/2019
+  says this tract is fine" as measuring related-but-different things, and say so
+  explicitly in the Phase 8 write-up rather than treating 2025 as a drop-in refresh
+  of 2019.
+
+Usage:
+    python src/ingest_fara.py
+    python src/ingest_fara.py --state "Alabama" --county "Shelby County"  # reusable, per Aim 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_2019_ZIP = REPO_ROOT / "data" / "raw" / "2019_Food_Access_Research_Atlas_Data.zip"
+DEFAULT_2025_ZIP = REPO_ROOT / "data" / "raw" / "2025-sram-fara-data.zip"
+DEFAULT_OUT_DIR = REPO_ROOT / "data" / "processed"
+
+NULL_TOKENS = ["NULL", "null", ""]
+
+
+def _read_member(zip_path: Path, member: str, **kwargs) -> pd.DataFrame:
+    """Read one named CSV member out of a zip without extracting the archive to disk."""
+    with zipfile.ZipFile(zip_path) as zf:
+        with zf.open(member) as fh:
+            return pd.read_csv(fh, **kwargs)
+
+
+def load_2019_atlas(zip_path: Path, state: str, county: str) -> pd.DataFrame:
+    """Phase 1b, source 1: the classic (LRAM-vintage) Atlas, 2010 Census tracts."""
+    df = _read_member(
+        zip_path,
+        "Food Access Research Atlas.csv",
+        dtype={"CensusTract": str, "State": str, "County": str},
+        na_values=NULL_TOKENS,
+        keep_default_na=True,
+        low_memory=False,
+    )
+    df["CensusTract"] = df["CensusTract"].str.zfill(11)  # recover any lost leading zero
+
+    out = df[(df["State"] == state) & (df["County"] == county)].copy()
+    if out.empty:
+        raise ValueError(
+            f"No 2019 Atlas rows matched State={state!r}, County={county!r}. "
+            f"Check exact spelling — County is stored as e.g. 'Shelby County', not 'Shelby'."
+        )
+
+    numeric_cols = [c for c in out.columns if c not in ("CensusTract", "State", "County")]
+    for c in numeric_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.copy()  # defragment: the per-column loop above leaves this internally fragmented
+
+    out = out.rename(columns={"CensusTract": "tract_geoid_2010"})
+    out.insert(0, "vintage", "2019_atlas_lram")
+    return out.reset_index(drop=True)
+
+
+def load_2025_sram(zip_path: Path, state: str, county: str) -> pd.DataFrame:
+    """Phase 1b, source 2: the 2025 SRAM release, 2020 Census tracts, 3 files merged."""
+    common_kwargs = dict(dtype=str, encoding="latin-1", keep_default_na=True, low_memory=False)
+
+    general = _read_member(zip_path, "SRAM General Tract Characteristics Data.csv", **common_kwargs)
+    straight = _read_member(zip_path, "SRAM Straight Line Distance Data.csv", **common_kwargs)
+    driving = _read_member(zip_path, "SRAM Driving Distance Data.csv", **common_kwargs)
+
+    frames = {}
+    for name, df in [("general", general), ("straight", straight), ("driving", driving)]:
+        df = df.copy()
+        df["CensusTract20"] = df["CensusTract20"].str.zfill(11)
+        sub = df[(df["State"] == state) & (df["County20"] == county)].copy()
+        if sub.empty:
+            raise ValueError(
+                f"No 2025 SRAM '{name}' rows matched State={state!r}, County20={county!r}."
+            )
+        frames[name] = sub
+
+    merged = frames["general"].merge(
+        frames["straight"].drop(columns=["State", "County20", "County24"], errors="ignore"),
+        on="CensusTract20", how="inner", validate="one_to_one",
+    ).merge(
+        frames["driving"].drop(columns=["State", "County20", "County24"], errors="ignore"),
+        on="CensusTract20", how="inner", validate="one_to_one",
+    )
+
+    if len(merged) != len(frames["general"]):
+        raise ValueError(
+            f"Merge of general/straight/driving SRAM tables dropped rows: "
+            f"general had {len(frames['general'])}, merged has {len(merged)}. "
+            f"The three files are expected to share an identical tract set."
+        )
+
+    id_cols = ["CensusTract20", "State", "County20", "County24"]
+    numeric_cols = [c for c in merged.columns if c not in id_cols]
+    for c in numeric_cols:
+        merged[c] = pd.to_numeric(merged[c], errors="coerce")
+    merged = merged.copy()  # defragment: the per-column loop above leaves this internally fragmented
+
+    merged = merged.rename(columns={"CensusTract20": "tract_geoid_2020"})
+    merged.insert(0, "vintage", "2025_sram")
+    return merged.reset_index(drop=True)
+
+
+def copy_lookups(out_dir: Path) -> None:
+    """Small (<40KB each) variable dictionaries — worth keeping next to the data they describe."""
+    lookup_dir = out_dir / "fara_lookups"
+    lookup_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(DEFAULT_2019_ZIP) as zf:
+        lookup_dir.joinpath("2019_VariableLookup.csv").write_bytes(zf.read("VariableLookup.csv"))
+    with zipfile.ZipFile(DEFAULT_2025_ZIP) as zf:
+        for member, out_name in [
+            ("SRAM Variable Lookup General Tract Characteristics.csv", "2025_VariableLookup_General.csv"),
+            ("SRAM Variable Lookup Straight Line Distance.csv", "2025_VariableLookup_StraightLine.csv"),
+            ("SRAM Variable Lookup Driving Distance.csv", "2025_VariableLookup_Driving.csv"),
+        ]:
+            lookup_dir.joinpath(out_name).write_bytes(zf.read(member))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--state", default="Tennessee")
+    parser.add_argument("--county", default="Shelby County", help="Must match the Atlas's own County spelling, e.g. 'Shelby County'.")
+    parser.add_argument("--zip-2019", type=Path, default=DEFAULT_2019_ZIP)
+    parser.add_argument("--zip-2025", type=Path, default=DEFAULT_2025_ZIP)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    args = parser.parse_args()
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[ingest_fara] Loading 2019 Atlas ({args.zip_2019.name}) ...")
+    atlas_2019 = load_2019_atlas(args.zip_2019, args.state, args.county)
+    out_2019 = args.out_dir / "fara_2019_atlas_shelby.csv"
+    atlas_2019.to_csv(out_2019, index=False)
+    print(f"  -> {len(atlas_2019)} tracts (2010 vintage) -> {out_2019}")
+
+    print(f"[ingest_fara] Loading 2025 SRAM release ({args.zip_2025.name}) ...")
+    sram_2025 = load_2025_sram(args.zip_2025, args.state, args.county)
+    out_2025 = args.out_dir / "fara_2025_sram_shelby.csv"
+    sram_2025.to_csv(out_2025, index=False)
+    print(f"  -> {len(sram_2025)} tracts (2020 vintage) -> {out_2025}")
+
+    copy_lookups(args.out_dir)
+    print(f"[ingest_fara] Variable lookups copied to {args.out_dir / 'fara_lookups'}/")
+
+    # Quick QA readout — the kind of sanity check Milestone M1 asks for.
+    print("\n[ingest_fara] QA summary")
+    print(f"  2019 LILA (1mi/10mi) tracts flagged:      {int(atlas_2019['LILATracts_1And10'].sum())} / {len(atlas_2019)}")
+    print(f"  2025 SRAM straight-line LILA tracts:       {int(sram_2025['SD_SRAM_LILATracts_1And10'].sum())} / {len(sram_2025)}")
+    print(f"  2025 SRAM driving-distance LILA tracts:    {int(sram_2025['DD_SRAM_LILATracts_1And10'].sum())} / {len(sram_2025)}")
+    print(f"  2019 tracts with any NaN in PovertyRate:   {int(atlas_2019['PovertyRate'].isna().sum())}")
+    print(f"  2025 tracts with any NaN in PovertyRate:   {int(sram_2025['PovertyRate'].isna().sum())}")
+    print(
+        "\n  NOTE: 2019 tract count and 2025 tract count will legitimately differ "
+        "(2010 vs 2020 Census tract boundaries — tracts get split as areas grow). "
+        "Don't diff these two files tract-for-tract without a 2010->2020 crosswalk; "
+        "see the tract-vintage-mismatch pitfall in the tutorial (Phase 9 / Common Pitfalls)."
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,213 @@
+"""
+tests/test_build_demand.py — Phase 2 unit tests.
+
+Every fixture here is synthetic and deliberately fake-looking (state FIPS "99",
+county FIPS "999" — no real US county has these) so nothing in this file can ever
+be mistaken for real Shelby County / Memphis data. That real data only exists once
+you've run ingest_census.py yourself with a live API key; these tests exist to
+prove build_demand.py's logic is correct *before* you spend that API call, and to
+keep proving it every time you touch this file afterward.
+
+Run with:
+    pytest tests/test_build_demand.py -v
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+import pytest
+from shapely.geometry import box
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from build_demand import (  # noqa: E402
+    OUTPUT_COLUMNS,
+    build_demand_table,
+    compute_centroids,
+    compute_pct_no_vehicle,
+    compute_poverty_rate,
+    reconstruct_geoid,
+)
+
+# ---------------------------------------------------------------------------
+# Shared synthetic fixtures
+# ---------------------------------------------------------------------------
+# Three "real" block groups (A, B, C — present in both ACS and TIGER), plus one
+# TIGER-only phantom (D) and one ACS-only phantom (E), to exercise the merge's
+# mismatch handling. State "99" / county "999" are not real FIPS codes.
+
+ACS_ROWS = [
+    # GEOID          pop   pov_universe  pov_count  occ_units  owner_no_veh  renter_no_veh
+    ("999990000011", 1000, 1000,          250,        400,        20,            20),   # A: normal case
+    ("999990000012", 2000, 0,             0,          500,        50,            25),   # B: zero poverty universe
+    ("999990000021", 500,  500,           100,        0,          0,             0),    # C: zero occupied units
+    ("999990000041", 777,  777,           77,         100,        5,             5),    # E: ACS-only phantom
+]
+
+
+def _acs_df() -> pd.DataFrame:
+    rows = []
+    for geoid, pop, pov_u, pov_c, occ, own_nv, rent_nv in ACS_ROWS:
+        rows.append({
+            "state": geoid[0:2], "county": geoid[2:5], "tract": geoid[5:11], "block group": geoid[11:12],
+            "area_name": f"Test Block Group {geoid}",
+            "population_total": pop,
+            "poverty_universe": pov_u,
+            "poverty_count": pov_c,
+            "occupied_units_total": occ,
+            "owner_occupied_no_vehicle": own_nv,
+            "renter_occupied_no_vehicle": rent_nv,
+        })
+    return pd.DataFrame(rows)
+
+
+def _bg_gdf() -> gpd.GeoDataFrame:
+    # Small, non-overlapping unit boxes near an arbitrary, clearly-non-Memphis
+    # test coordinate (10E, 10N) — geometry only needs to be *valid*, not real.
+    geoms = {
+        "999990000011": box(10.00, 10.00, 10.01, 10.01),   # A
+        "999990000012": box(10.02, 10.00, 10.03, 10.01),   # B
+        "999990000021": box(10.00, 10.02, 10.01, 10.03),   # C
+        "999990000031": box(10.02, 10.02, 10.03, 10.03),   # D: TIGER-only phantom
+    }
+    return gpd.GeoDataFrame(
+        {"GEOID": list(geoms.keys())},
+        geometry=list(geoms.values()),
+        crs="EPSG:4326",
+    )
+
+
+# ---------------------------------------------------------------------------
+# reconstruct_geoid
+# ---------------------------------------------------------------------------
+
+def test_reconstruct_geoid_basic():
+    df = pd.DataFrame([{"state": "99", "county": "999", "tract": "000001", "block group": "1"}])
+    out = reconstruct_geoid(df)
+    assert out.loc[0, "GEOID"] == "999990000011"
+    assert len(out.loc[0, "GEOID"]) == 12
+
+
+def test_reconstruct_geoid_recovers_lost_leading_zeros():
+    """Mirrors the exact bug hit for real in ingest_fara.py: a leading zero lost
+    somewhere upstream (e.g. by round-tripping through a plain int) must be
+    recoverable by zero-padding each piece to its correct fixed width."""
+    df = pd.DataFrame([{"state": "5", "county": "7", "tract": "123", "block group": "1"}])
+    out = reconstruct_geoid(df)
+    assert out.loc[0, "GEOID"] == "050070001231"
+
+
+def test_reconstruct_geoid_missing_column_raises():
+    df = pd.DataFrame([{"state": "99", "county": "999", "block group": "1"}])  # no 'tract'
+    with pytest.raises(KeyError):
+        reconstruct_geoid(df)
+
+
+# ---------------------------------------------------------------------------
+# compute_poverty_rate
+# ---------------------------------------------------------------------------
+
+def test_poverty_rate_normal_division():
+    df = pd.DataFrame([{"poverty_universe": 1000, "poverty_count": 250}])
+    out = compute_poverty_rate(df)
+    assert out.loc[0, "poverty_rate"] == pytest.approx(0.25)
+
+
+def test_poverty_rate_zero_universe_is_nan_not_zero():
+    df = pd.DataFrame([{"poverty_universe": 0, "poverty_count": 0}])
+    out = compute_poverty_rate(df)
+    assert pd.isna(out.loc[0, "poverty_rate"])
+
+
+def test_poverty_rate_nan_universe_is_nan():
+    df = pd.DataFrame([{"poverty_universe": float("nan"), "poverty_count": 5}])
+    out = compute_poverty_rate(df)
+    assert pd.isna(out.loc[0, "poverty_rate"])
+
+
+# ---------------------------------------------------------------------------
+# compute_pct_no_vehicle
+# ---------------------------------------------------------------------------
+
+def test_pct_no_vehicle_normal_division():
+    df = pd.DataFrame([{"occupied_units_total": 400, "owner_occupied_no_vehicle": 20, "renter_occupied_no_vehicle": 20}])
+    out = compute_pct_no_vehicle(df)
+    assert out.loc[0, "pct_no_vehicle"] == pytest.approx(0.10)
+
+
+def test_pct_no_vehicle_zero_total_is_nan_not_zero():
+    df = pd.DataFrame([{"occupied_units_total": 0, "owner_occupied_no_vehicle": 0, "renter_occupied_no_vehicle": 0}])
+    out = compute_pct_no_vehicle(df)
+    assert pd.isna(out.loc[0, "pct_no_vehicle"])
+
+
+# ---------------------------------------------------------------------------
+# compute_centroids
+# ---------------------------------------------------------------------------
+
+def test_compute_centroids_matches_box_center():
+    gdf = gpd.GeoDataFrame(
+        {"GEOID": ["999990000011"]},
+        geometry=[box(10.00, 10.00, 10.01, 10.01)],
+        crs="EPSG:4326",
+    )
+    out = compute_centroids(gdf, projected_crs="EPSG:3857")
+    # a small, symmetric box's true centroid is its midpoint; EPSG:3857's y-nonlinearity
+    # is negligible at this scale, so this should land within ~1e-6 degrees of it
+    assert out.loc[0, "lon"] == pytest.approx(10.005, abs=1e-6)
+    assert out.loc[0, "lat"] == pytest.approx(10.005, abs=1e-6)
+
+
+def test_compute_centroids_output_is_finite():
+    gdf = _bg_gdf()
+    out = compute_centroids(gdf, projected_crs="EPSG:3857")
+    assert out["lat"].notna().all()
+    assert out["lon"].notna().all()
+    assert out["lat"].between(-90, 90).all()
+    assert out["lon"].between(-180, 180).all()
+
+
+# ---------------------------------------------------------------------------
+# build_demand_table — full pipeline
+# ---------------------------------------------------------------------------
+
+def test_build_demand_table_end_to_end():
+    demand = build_demand_table(_acs_df(), _bg_gdf(), projected_crs="EPSG:3857")
+
+    # D (TIGER-only) and E (ACS-only) must be dropped; only A, B, C survive
+    assert len(demand) == 3
+    assert set(demand["block_group_id"]) == {"999990000011", "999990000012", "999990000021"}
+
+    assert list(demand.columns) == OUTPUT_COLUMNS
+
+    row_a = demand.set_index("block_group_id").loc["999990000011"]
+    assert row_a["population"] == 1000
+    assert row_a["poverty_rate"] == pytest.approx(0.25)
+    assert row_a["pct_no_vehicle"] == pytest.approx(0.10)
+    assert row_a["tract_id"] == "99999000001"
+
+    row_b = demand.set_index("block_group_id").loc["999990000012"]
+    assert pd.isna(row_b["poverty_rate"])          # zero poverty universe
+    assert row_b["pct_no_vehicle"] == pytest.approx(0.15)
+    assert row_b["tract_id"] == "99999000001"       # same tract as A
+
+    row_c = demand.set_index("block_group_id").loc["999990000021"]
+    assert row_c["poverty_rate"] == pytest.approx(0.20)
+    assert pd.isna(row_c["pct_no_vehicle"])         # zero occupied units
+    assert row_c["tract_id"] == "99999000002"        # different tract from A/B
+
+
+def test_build_demand_table_is_sorted_by_block_group_id():
+    demand = build_demand_table(_acs_df(), _bg_gdf(), projected_crs="EPSG:3857")
+    assert list(demand["block_group_id"]) == sorted(demand["block_group_id"])
+
+
+def test_build_demand_table_tract_rollup_nests_exactly():
+    """Phase 8 rolls block groups up to tracts assuming clean nesting — confirm
+    tract_id really is just the block group's own GEOID, truncated, for every row."""
+    demand = build_demand_table(_acs_df(), _bg_gdf(), projected_crs="EPSG:3857")
+    assert (demand["tract_id"] == demand["block_group_id"].str[:11]).all()
